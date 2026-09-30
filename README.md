@@ -258,3 +258,7 @@ SMOKE_AI=1 .venv/bin/python smoke_test.py    # + один настоящий о�
 | `VOICE` · `VOICE_MAX_SECONDS` | `1` · `300` | расшифровка голосовых |
 | `TTS` · `TTS_VOICE` · `TTS_EMOTION` · `TTS_SPEED` | `1` · `zahar` · `good` · `1.1` | голос бота |
 | `DB_PATH` | `data/bot.db` | где хранить базу |
+
+## Лицензия
+
+[MIT](LICENSE). Треки для эдитов качаются с YouTube и принадлежат их авторам, модели для лиц — OpenCV Zoo (Apache 2.0).
