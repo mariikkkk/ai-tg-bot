@@ -43,7 +43,12 @@ MAX_LINES = 3  # столько коротких сообщений подряд
 PACK_MAX_AGE = 3600
 EXAMPLE_WINDOWS, WINDOW_LINES, EXAMPLE_PHRASES = 10, 20, 40
 
-LIKELY_PLACES = ["~/.local/bin", "~/.claude/local", "~/.npm-global/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+LIKELY_PLACES = [
+    "~/.local/bin", "~/.claude/local", "~/.npm-global/bin", "/opt/homebrew/bin", "/usr/local/bin",
+    # Codex CLI, встроенный в приложения ChatGPT и Codex для macOS: вход — тот же, что в приложении
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin", "/Applications/Codex.app/Contents/Resources/codex-cli/bin",
+    "/Applications/Codex.app/Contents/Resources",
+]
 PROVIDER_CHOICE = os.getenv("AI_PROVIDER", "auto").strip().lower()  # claude | codex | auto
 CODEX_MODEL = os.getenv("CODEX_MODEL", "")            # пусто — модель Codex по умолчанию
 CODEX_FAST_MODEL = os.getenv("CODEX_FAST_MODEL", "")  # для рутины (стикеры, кадры); пусто — CODEX_MODEL
