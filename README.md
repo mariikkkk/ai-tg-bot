@@ -34,7 +34,7 @@ Telegram-бот, который живёт в вашей беседе как е�
 
 ### 2. Поставить
 ```bash
-git clone <этот репозиторий> meme-bot && cd meme-bot
+git clone https://github.com/mariikkkk/ai-tg-bot.git && cd ai-tg-bot
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env
