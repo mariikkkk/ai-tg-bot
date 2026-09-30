@@ -1,0 +1,8 @@
+aiogram>=3.20,<4
+pillow>=10.1
+python-dotenv>=1.0
+imageio-ffmpeg>=0.5
+certifi>=2024.2
+yt-dlp>=2026.1
+numpy>=1.26
+opencv-python-headless  # узнавать в лицо тех, кто записался через /face (необязательно)
