@@ -315,7 +315,43 @@ async def main():
     assert await feed(text="пацаны го в доту") == []  # Claude промолчал…
     assert await feed(text="кто со мной") == []       # …и разговор закончился — даже не спрашиваем
     assert calls == [False, True, True], calls
-    print("✓ отвечает, когда зовут по имени без тега, и на продолжение разговора; молчит, когда не ему")
+    # Без прямого обращения — не больше FOLLOWUP_MAX ответов подряд, а то надоедает.
+    calls.clear()
+
+    async def chatty(*_args, maybe=False, **_kwargs):
+        calls.append(maybe)
+        return ai.Reply(lines=[f"ответ {len(calls)}"])
+    ai.say = chatty
+    await feed(text="Мемобот, поговорим?")
+    for i in range(memebot.FOLLOWUP_MAX + 2):
+        await feed(text=f"и ещё {i}")
+    assert calls == [False] + [True] * memebot.FOLLOWUP_MAX, calls
+    memebot._talks.clear()
+    print("✓ отвечает, когда зовут по имени без тега, и на продолжение разговора (но не бесконечно); молчит, когда не ему")
+
+    # Не заедает: свои недавние реплики и заезженные слова — в подсказке; повтор — переспросить, не вышло — промолчать.
+    rc = Chat(id=-100444, type="supergroup", title="Повторы")
+    for line in ("лаваш опять порвался", "кринж кринж братан", "ну кринж же", "кринж навсегда", "ладно, понял тебя"):
+        ai.remember(rc.id, "Мемобот", line)
+    ai.remember(rc.id, "Вася", "бот как дела")
+    assert ai.overused_words(ai.own_lines(rc.id, "Мемобот")) == ["кринж"]
+    assert ai.repeats("Лаваш опять порвался!!", ai.own_lines(rc.id, "Мемобот")) and not ai.repeats("лол", ["ахах"])
+    drafts = iter(["лаваш опять порвался", "норм, на смене", "лаваш опять порвался", "лаваш опять порвался"])
+    prompts = []
+
+    async def fake_repeat_ask(system, prompt, image=None, model=None, **_):
+        prompts.append(prompt)
+        return {"result": next(drafts), "usage": {}}
+
+    real_say_ask, real_say_avail = ai._ask, ai.available
+    ai._ask, ai.available = fake_repeat_ask, (lambda: True)
+    r = await real_say(rc.id, "Мемобот", "Повторы", memebot.examples_loader(rc.id), "Вася")
+    assert r.lines == ["норм, на смене"] and len(prompts) == 2, (r, prompts)
+    assert "заладил: кринж" in prompts[0] and "повторяет то, что ты уже говорил" in prompts[1]
+    assert await real_say(rc.id, "Мемобот", "Повторы", memebot.examples_loader(rc.id), "Вася") is None  # дважды то же
+    ai._ask, ai.available = real_say_ask, real_say_avail
+    assert "частые слова" not in ai.style_of(["кринж", "кринж брат", "кринж"] * 20).rules
+    print("✓ не заедает: заезженные слова в подсказке, повтор — переспрашивает, снова повтор — молчит")
 
     # Голосовые: расшифровка (SpeechKit подменён), обращение голосом, /text.
     import speech  # noqa: PLC0415
@@ -522,12 +558,15 @@ async def main():
             return {"result": "Выжимка:\n## Люди\n- Катя — сдаёт матан", "usage": {}}
         if "не забывать" in system:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + 5 * 3600))
-            return {"result": f"{when} | Катя | экзамен по матану\nчушь без формата", "usage": {}}
+            assert "передразнивание" in prompt  # шутки и чужие слова планами не считаются
+            return {"result": f"{when} | Дима | экзамен по матану | завтра экзамен по матану, молитесь\n"
+                              f"{when} | Дима | дача | в субботу едем на дачу всей толпой\nчушь без формата", "usage": {}}
         assert "<lore>" in system and "сдаёт матан" in system  # летопись — в закэшированной части
         if "не пишет в чат" in prompt:
             assert "Дима не пишет в чат уже 8" in prompt
             return {"result": silent_answer, "usage": {}}
-        assert "экзамен по матану" in prompt
+        assert "писал: «завтра экзамен по матану, молитесь»" in prompt and "<context>" in prompt, prompt
+        assert "сообщение 39" in prompt  # что писали вокруг — чтобы не спросить всерьёз про шутку
         return {"result": "Катя ну че, сдала матан?", "usage": {}}
 
     ai._ask, ai.available = fake_ask, (lambda: True)
@@ -538,7 +577,8 @@ async def main():
     await memebot.update_lore(bot, mem.id)  # нового нет — ничего не делает
     await memebot.update_plans(bot, mem.id)
     plans = memebot.storage.open_plans(mem.id)
-    assert [p["who"] for p in plans] == ["Катя"], plans
+    # Кто — настоящий автор фразы (модель сказала «Дима»), а план про фразу, которой в чате не было, — отброшен.
+    assert [(p["who"], p["quote"]) for p in plans] == [("Катя", "завтра экзамен по матану, молитесь")], plans
     memebot.storage.touch_member(mem.id, 5, "пельмешка")
     memebot.storage.set_person(mem.id, "пельмешка", "Катя")
     ai.refresh(mem.id)
@@ -551,6 +591,10 @@ async def main():
     assert memebot._talks[mem.id].user_id == 5  # ответит без тега — бот поймёт, что это ему
     assert not memebot.storage.open_plans(mem.id)
     assert not await memebot.initiative_tick(bot, mem.id)  # не чаще раза в полтора часа
+    memebot.storage.add_plan(mem.id, "Катя", "старый план без цитаты", int(time.time()) - 60)
+    assert await memebot.ask_about_plan(bot, mem.id, time.time()) is None  # не знаем, всерьёз ли — не спрашиваем
+    assert not memebot.storage.open_plans(mem.id)
+    assert ai.strip_contacts("**Паша (Паша, @pasha_tg)** — почта pasha@ya.ru, качается") == "**Паша (Паша)** — качается"
     # Пропавший: писал много, молчит 8 дней. Claude может и промолчать — тогда не повторяем сразу.
     memebot.storage.touch_member(mem.id, 6, "Shadow")
     memebot.storage.set_person(mem.id, "Shadow", "Дима")
@@ -601,7 +645,8 @@ async def main():
     assert "Настроение: задет — Лёха доёбывал" in state and "- Катя: чуть теплее обычного (угарнула)" in state, state
     assert "- Лёха: бесит (доёбывал политикой)" in state and "Мемобот" not in state, state
     assert "Лёха: бесит" in ai._prompt(ch.id, "задача")
-    assert "Настроение: задет" in (await feed(["SendMessage"], chat=ch, text="/mood"))[0].text
+    mood_text = (await feed(["SendMessage"], chat=ch, text="/mood"))[0].text
+    assert "Настроение: задет" in mood_text and "- Лёха: бесит" in mood_text, mood_text
     with memebot.storage.db:
         memebot.storage.db.execute("UPDATE relations SET updated_at = ?", (int(time.time()) - 9 * 86400,))
     assert "- Лёха" not in memebot.state_text(ch.id)  # за 9 дней обида остыла
@@ -624,7 +669,10 @@ async def main():
     assert [m.text for m in session.sent[before:] if isinstance(m, SendMessage)] == ["пацаны меня на кассу поставили прикиньте"]
     assert not await memebot.share_life(bot, ch.id, noon + 3600)  # уже рассказал
     ai._ask, ai.available = real_ask, real_avail
-    print("✓ характер: настроение и отношения в запросе, /mood, обиды остывают, своя жизнь и рассказ о ней")
+    eps = [{"text": t} for t in ("Даша: видео 300 просмотров", "видео уже 500 просмотров, мама рада",
+                                 "Даша сказала, видео 700 просмотров", "Мемобот купил кефир")]
+    assert set(ai.stale_themes(eps, "Мемобот")) == {"видео", "просмотров"}  # приелось — сериал это закроет
+    print("✓ характер: настроение и отношения в запросе, /mood, обиды остывают, своя жизнь и рассказ о ней, без заезженных линий")
 
     # Лица (поиск лиц подменён — в тестовых картинках лиц нет): записаться можно только самому, узнаёт
     # на присланных фото (история для Claude, база для эдитов), подсказывает подпись к мему, /face забудь.

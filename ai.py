@@ -22,6 +22,7 @@ import time
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -67,6 +68,7 @@ SYSTEM = """Ты — {name}, свой в беседе «{chat}». Не асси�
 - Можно ответить несколькими короткими сообщениями подряд — каждое с новой строки, не больше трёх.{extras}
 - Людей из чата знаешь по переписке — обращайся к ним так же, как они друг к другу.
 - Спросили по делу — ответь по делу, но так же коротко и в том же тоне.
+- Про людей говоришь только то, что точно знаешь из переписки. Летопись и старые разговоры могли устареть, а шутку, иронию или пересказ чужих слов легко принять за правду — не уверен, спроси или промолчи. Подробностей не выдумывай.
 - Твой кодекс — это часть тебя, а не правила сверху:
   • Мамы — святое. У тебя самого мама, за неё любого порвёшь. Никаких шуток про мам и «твою мать» — ни про чьих.
   • С девчонками шутишь и подкалываешь так же, как со всеми, но без пошлятины — у тебя младшая сестра: никакого секса, намёков, пошлых шуток и оценок внешности и тела девушек — ни тех, кто в чате, ни тех, кто на фотках и авах.
@@ -226,8 +228,6 @@ def style_of(phrases: list[str]) -> Style:
     else:
         rules.append("- почти не матерятся — и ты не матерись")
 
-    common = Counter(w for w in words if len(w) > 2 and w not in STOP_WORDS and not MAT_RE.search(w))
-    rules.append("- частые слова: " + ", ".join(w for w, _ in common.most_common(25)))
     return Style("\n".join(rules), periods < 0.05)
 
 
@@ -613,6 +613,59 @@ def _tidy(text: str, name: str, no_periods: bool) -> Reply:
     )
 
 
+# --- чтобы не заедало ---
+
+REPEAT_SIMILARITY = 0.72  # похожесть на недавнюю свою реплику, с которой это уже повтор
+
+
+def own_lines(chat_id: int, bot_name: str, count: int = 15) -> list[str]:
+    """Последние реплики самого бота в этой беседе."""
+    prefix = f"{bot_name}:"
+    return [line[len(prefix):].strip() for _, line in _history[chat_id] if line.startswith(prefix)][-count:]
+
+
+def overused_words(lines: list[str]) -> list[str]:
+    """Слова, которые бот заладил: встречаются в трёх и больше из его последних восьми реплик (мат — не в счёт)."""
+    counts = Counter(w for line in lines[-8:] for w in set(WORD_RE.findall(line.lower()))
+                     if len(w) >= 4 and w not in STOP_WORDS and not MAT_RE.search(w))
+    return [w for w, n in counts.most_common(6) if n >= 3]
+
+
+def _plain(text: str) -> str:
+    return " ".join(WORD_RE.findall(text.lower()))
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, _plain(a), _plain(b)).ratio()
+
+
+def similar(a: str, b: str) -> bool:
+    """Про одно и то же (для склейки похожих планов)."""
+    return similarity(a, b) >= 0.5
+
+
+def repeats(line: str, recent: list[str]) -> bool:
+    """Реплика почти повторяет одну из недавних своих (короткие «ахах» — только если слово в слово)."""
+    plain = _plain(line)
+    if not plain:
+        return False
+    if len(plain) < 12:
+        return any(plain == _plain(r) for r in recent)
+    return any(SequenceMatcher(None, plain, _plain(r)).ratio() >= REPEAT_SIMILARITY for r in recent)
+
+
+def variety_note(chat_id: int, bot_name: str) -> str:
+    """Подсказка в задачу: не повторяй свои шутки и слова, реагируй по-разному."""
+    recent = own_lines(chat_id, bot_name)
+    if not recent:
+        return ""
+    note = ("\nНе повторяйся: свои шутки, обороты и начала фраз из последних реплик выше не используй снова. "
+            "Реагируй по-разному, как живой: то подколи, то поддержи, спроси, удивись, согласись, расскажи своё.")
+    if words := overused_words(recent):
+        note += f" Ты в последнее время заладил: {', '.join(words)} — сейчас без этих слов."
+    return note
+
+
 async def say(
     chat_id: int,
     bot_name: str,
@@ -629,16 +682,25 @@ async def say(
         return None
     pack = await _pack_for(chat_id, bot_name, chat_title, load_examples)
     task = (TASK_MAYBE if maybe else TASK_REPLY).format(author=author) if author else TASK_CHIME_IN
+    task += variety_note(chat_id, bot_name)
     if lookup:  # бот поискал в интернете, о чём спрашивают, — чтобы ответить в теме
         task = f"Нашёл в интернете по этому поводу:\n<search>\n{lookup}\n</search>\n\n{task}"
+    recent = own_lines(chat_id, bot_name)
     started = time.monotonic()
     try:
         result = await _ask(pack.system, _prompt(chat_id, task))
+        _log_usage("ответил", started, result)
+        reply = _tidy(result["result"], bot_name, pack.no_periods)
+        if stale := [line for line in reply.lines if repeats(line, recent)]:  # заело — пусть скажет иначе
+            log.info("Повторялся («%s») — переспрашиваю", " / ".join(stale))
+            again = (f"{task}\nТвой черновик повторяет то, что ты уже говорил: «{' / '.join(stale)}». "
+                     "Скажи по-другому, о другом или ответь «-».")
+            result = await _ask(pack.system, _prompt(chat_id, again))
+            reply = _tidy(result["result"], bot_name, pack.no_periods)
+            reply.lines = [line for line in reply.lines if not repeats(line, recent)]
     except Exception as e:  # noqa: BLE001 — любая беда с claude = бот ответит без ИИ
-        log.warning("Claude не ответил: %s", e)
+        log.warning("%s не ответил: %s", NAME, e)
         return None
-    _log_usage("ответил", started, result)
-    reply = _tidy(result["result"], bot_name, pack.no_periods)
     if reply.sticker and reply.sticker.isdigit() and 1 <= int(reply.sticker) <= len(pack.stickers):
         reply.sticker_file = pack.stickers[int(reply.sticker) - 1]
     return None if reply.empty else reply
@@ -1020,6 +1082,21 @@ LORE_BANNED = re.compile(
 SENTENCE_RE = re.compile(r"(?<=[.!?;])\s+")
 
 
+CONTACT_RE = re.compile(
+    r"(?:,\s*)?(?:почт[аеуы]|e-?mail|телефон)?\s*[:—-]?\s*[\w.+-]+@[\w-]+(?:\.[\w.-]+)?"  # почта (в т. ч. без точки в домене: name@company-team)
+    r"|(?:,\s*)?@\w{3,}"                                                                # @логин
+    r"|(?:\+7|\b8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}",                  # телефон
+    re.IGNORECASE,
+)
+
+
+def strip_contacts(text: str) -> str:
+    """Почты, телефоны и @логины — не для летописи."""
+    text = re.sub(r"\(\s*,?\s*\)", "", CONTACT_RE.sub("", text))
+    text = re.sub(r"([—:])[ \t]*,[ \t]*", r"\1 ", text)  # «— , качается» → «— качается»
+    return re.sub(r"[ \t]{2,}", " ", text)
+
+
 def _clauses(sentence: str) -> list[str]:
     """Части фразы между запятыми — запятые внутри скобок не считаются."""
     parts, depth, cur = [], 0, ""
@@ -1069,7 +1146,7 @@ async def lore_clean(bot_name: str, lore: str) -> str:
     text = result["result"].replace("<lore>", "").replace("</lore>", "").strip()
     if "## Люди" in text:
         lore = text[text.index("## Люди"):]
-    lore, removed = scrub_lore(lore)
+    lore, removed = scrub_lore(strip_contacts(lore))
     if removed:
         log.info("Из летописи вырезано по стоп-словам: %d строк", removed)
     return lore
@@ -1116,11 +1193,14 @@ async def lore_merge(chat_title: str, bot_name: str, lore: str, digests: list[tu
 
 PLANS_SYSTEM = "Ты помогаешь {bot}, участнику дружеской беседы, не забывать, что у друзей происходит."
 PLANS_TASK = """{now}
-Ниже — новые сообщения беседы (у каждого время). Найди планы и события участников, про которые свой человек \
-потом спросил бы: экзамены, защиты, зачёты, собеседования, поездки, тусовки, матчи, концерты, покупки, дела.
-Не бери личное: свидания и отношения, здоровье, семью, деньги.
+Ниже — новые сообщения беседы (у каждого время). Найди планы, которые участник сам, всерьёз и прямо говорит про \
+себя («у меня завтра экзамен», «в субботу едем на дачу», «в пятницу собес») и про которые свой человек потом \
+спросил бы: экзамены, защиты, зачёты, собеседования, поездки, тусовки, матчи, концерты, покупки, дела.
+Не бери: шутки, иронию, мемы, передразнивание и пересказ чужих слов, планы других людей (не автора сообщения), \
+вопросы, «может быть». Не бери личное: свидания и отношения, здоровье, семью, деньги. Сомневаешься — не бери.
 
-Для каждого — одна строка: «когда спросить (ГГГГ-ММ-ДД ЧЧ:ММ) | кто (имя) | о чём — коротко, с контекстом».
+Для каждого — одна строка: «когда спросить (ГГГГ-ММ-ДД ЧЧ:ММ) | кто (автор сообщения) | о чём — коротко | \
+цитата — его сообщение дословно».
 Спрашивать — когда событие уже прошло: экзамен завтра утром → завтра 17:00; поездка на выходных → воскресенье \
 вечером; если время события неизвестно — в тот же день вечером (19:00–21:00). «Завтра», «в субботу» считай от времени сообщения, а не от текущего. Время — с 11:00 до 22:00, не раньше \
 чем через 2 часа от текущего момента и не позже чем через 14 дней. Прошедшее и то, что уже обсудили, не бери.
@@ -1129,12 +1209,13 @@ PLANS_TASK = """{now}
 {people}<messages>
 {messages}
 </messages>"""
-PLAN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})\s*\|\s*([^|]+?)\s*\|\s*(.+)")
+PLAN_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2})\s*\|\s*([^|\n]+?)\s*\|\s*([^|\n]+?)\s*\|\s*(.+?)\s*$",
+                     re.MULTILINE)
 
 
 async def find_plans(bot_name: str, rows: list[tuple[int, str, str, int]], people: list[tuple[str, str]],
-                     planned: list[dict]) -> list[tuple[int, str, str]]:
-    """[(когда спросить, кто, о чём)] из новых сообщений."""
+                     planned: list[dict]) -> list[tuple[int, str, str, str]]:
+    """[(когда спросить, кто, о чём, цитата)] из новых сообщений."""
     have = "".join(f"— {p['who']}: {p['about']}\n" for p in planned)
     prompt = PLANS_TASK.format(now=_now_line(), people=_people_line(people), messages=format_dialog(rows),
                                planned=f"Уже запомнено (не повторяй):\n{have}" if have else "")
@@ -1147,16 +1228,19 @@ async def find_plans(bot_name: str, rows: list[tuple[int, str, str, int]], peopl
             at = int(time.mktime(time.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")))
         except ValueError:
             continue
-        found.append((at, m.group(3).strip(" *«»")[:60], m.group(4).strip(" *")[:200]))
+        found.append((at, m.group(3).strip(" *«»")[:60], m.group(4).strip(" *")[:200], m.group(5).strip(" *«»\"")[:300]))
     return found
 
 
 # --- бот пишет первым ---
 
 TASK_FOLLOWUP = (
-    "Ты сам пишешь в чат первым. Ты помнишь: {who} — {about} (об этом говорили {when}). Спроси, как прошло, как свой: "
-    "коротко, в стиле чата, по имени, можно подколоть. Не говори, что «записал» или «запомнил» — ты просто помнишь. "
-    "Если по последним сообщениям видно, что это уже обсудили, отменилось или спрашивать сейчас странно, — ответь «-»."
+    "Ты сам пишешь в чат первым. {when} {who} писал: «{quote}». Вот как это было:\n<context>\n{context}\n</context>\n"
+    "Если по этому видно, что это была шутка, ирония, пересказ чужих слов или речь не про него самого, — ответь «-». "
+    "Иначе спроси, как с этим в итоге, — вопросом, без утверждений и догадок: ты не знаешь, случилось ли это и как "
+    "(планы меняются). Не добавляй подробностей, которых не было, и не цепляй к вопросу другие темы из чата. Коротко, "
+    "в стиле чата, по имени; не говори, что «записал» или «запомнил». Если по последним сообщениям видно, что это уже "
+    "обсудили или спрашивать сейчас странно, — тоже «-»."
 )
 TASK_SILENT = (
     "Ты сам пишешь в чат первым: {who} не пишет в чат уже {days} дн. Позови, как свой: коротко, в стиле чата, по имени, "
@@ -1172,11 +1256,13 @@ async def initiative(chat_id: int, bot_name: str, chat_title: str, load_examples
         return None
     pack = await _pack_for(chat_id, bot_name, chat_title, load_examples)
     prompt = (f"{_now_line()}{_state_part(chat_id)}\nПоследние сообщения:\n<chat>\n{format_dialog(recent)}"
-              f"\n</chat>\n\n{task}")
+              f"\n</chat>\n\n{task}{variety_note(chat_id, bot_name)} Одно-два связных сообщения, без каши из тем.")
     started = time.monotonic()
     result = await _ask(pack.system, prompt)
     _log_usage("написал первым", started, result)
     reply = _tidy(result["result"], bot_name, pack.no_periods)
+    recent = own_lines(chat_id, bot_name)
+    reply.lines = [line for line in reply.lines if not repeats(line, recent)]  # то же самое второй раз — не пишем
     reply.reaction = reply.picture = reply.clip = reply.edit = None  # реагировать не на что, остальное — лишнее
     if reply.sticker and reply.sticker.isdigit() and 1 <= int(reply.sticker) <= len(pack.stickers):
         reply.sticker_file = pack.stickers[int(reply.sticker) - 1]
@@ -1204,9 +1290,12 @@ CHARACTER_RULE = (
     "как живой: любимчику теплее, чаще за него впишешься; с соперником — вечный бэф, подколы и спор, но без злобы; "
     "когда задет — отвечаешь суше, язвишь, можешь проигнорить подкол; в духе — щедрый на шутки.\n"
     "- Не называй своё настроение словами из блока и не пиши никаких цифр. Обиды игровые — отходишь быстро. "
+    "Настроение лишь чуть окрашивает тон, а не делает тебя пластинкой: не зацикливайся на одном раздражителе. "
     "Кодекс сильнее характера.\n"
-    "- Твоя жизнь идёт своим чередом (блок <life>, если есть): к месту упоминай, что у тебя происходит, "
-    "но не пересказывай всё и не в каждом сообщении."
+    "- Если человек всерьёз злится на тебя или просит отстать — отстань: не цепляй его и не отвечай ему, "
+    "пока сам не обратится по-доброму. Бэф — только в шутку и только если человек сам в нём участвует.\n"
+    "- Твоя жизнь идёт своим чередом (блок <life> и «по жизни сейчас»): говори о ней, если спросили или прямо "
+    "к слову, — не тащи её в чужие темы и не пересказывай одно и то же."
 )
 LIFE = ""  # что сейчас в жизни бота (бот обновляет из базы)
 
@@ -1216,9 +1305,9 @@ FEEL_TASK = """{now}
 Ниже — последние сообщения беседы (строки «{bot}: …» — это он сам) и его текущее состояние. Как эти сообщения \
 на него повлияли?
 
-1) Настроение — одно из: {moods} — и почему, до 10 слов.
+1) Настроение — одно из: {moods} — и почему: что случилось, до 10 слов (событие, а не то, как он себя ведёт: не «огрызается», «бесится», «на автомате»).
 2) Отношения — только для тех, кто в этих сообщениях как-то взаимодействовал с {bot}. Изменение от -{limit} до \
-+{limit} и заметка до 12 слов. Кто с ботом не взаимодействовал — не пиши.
++{limit} (обычно ±1, больше — только за что-то яркое) и заметка до 10 слов. Кто с ботом не взаимодействовал — не пиши.
 В этом чате все общаются матом и посылают друг друга — это норма и даже дружба: за мат, «иди нахуй», обзывательства \
 и подколы в шутку НЕ минусуй. Плюс — за внимание: болтали с ним, ржали с его шуток, звали, хвалили, играли, \
 заступались. Минус — только за настоящую неприязнь: гонят его из чата, просят удалить, всерьёз игнорят или бесятся.
@@ -1244,7 +1333,7 @@ RELATION_RE = re.compile(r"^\s*[-•*]?\s*([^:|\n]{2,40}?)\s*:\s*([+\-−–]?\s
 async def feel(bot_name: str, lines: list[str], state: str, people: list[tuple[str, str]], first: bool = False
                ) -> tuple[tuple[str, str] | None, list[tuple[str, int, str]]]:
     """Как последние сообщения повлияли на бота: ((настроение, почему) | None, [(имя, изменение, заметка)])."""
-    limit = 3 if first else 2
+    limit = 2 if first else 1
     extra = ("\nЭто первая оценка: по всей переписке пойми, кто как относится к боту." if first else "")
     prompt = FEEL_TASK.format(now=_now_line(), bot=bot_name, moods=", ".join(MOODS), limit=limit, extra=extra,
                               state=state or "(пока ничего)", people=_people_line(people), lines="\n".join(lines))
@@ -1274,8 +1363,10 @@ LIFE_DAY_TASK = """{now}
 {talk}
 Распиши сегодняшний день {bot}: 5–7 пунктов расписания с утра до ночи — во сколько, где он и что делает (до 12 слов, \
 живо и конкретно, по легенде: работа или учёба, дорога, семья, питомцы, соседи, мечты). В выходные день другой. И 1–2 события дня в конкретное время: бытовые, смешные, \
-продолжающие сюжет — развивай прошлые линии и то, что говорили в чате, иногда начинай новое. Без драмы: никаких \
-болезней, смертей, аварий, криминала, политики, войны, долгов. Мама — только в хорошем свете. Никакой пошлятины.
+живые. Чаще — что-то новое; прошлую линию можно коротко продолжить или закрыть, но одну линию не тяни дольше \
+2–3 дней и не повторяй одну и ту же сцену (кто-то за ужином объявляет очередные цифры — это уже было).{stale} \
+Без драмы: никаких болезней, смертей, аварий, криминала, политики, войны, долгов. Мама — только в хорошем свете. \
+Никакой пошлятины.
 
 Формат строго, время — ЧЧ:ММ:
 событие: ЧЧ:ММ | что случилось, 1–2 предложения, от третьего лица
@@ -1285,14 +1376,25 @@ EVENT_RE = re.compile(r"событие\s*\d*\s*:\s*(\d{1,2}:\d{2})\s*\|\s*(.+)",
 SLOT_RE = re.compile(r"^\s*[-•*]?\s*(\d{1,2}:\d{2})\s*\|\s*(.+)$", re.MULTILINE)
 
 
+def stale_themes(episodes: list[dict], bot_name: str) -> list[str]:
+    """Темы, которые сериал заездил: слово в трёх и больше из последних шести серий (кроме того, что есть в легенде)."""
+    base = {w[:5] for w in WORD_RE.findall((BIO + " " + bot_name).lower())}
+    counts = Counter(w for e in episodes[-6:] for w in set(WORD_RE.findall(e["text"].lower()))
+                     if len(w) >= 5 and w not in STOP_WORDS and w[:5] not in base
+                     and not re.search(r"(?:л|ла|ло|ли|лся|лась)$", w))  # «написал», «сказала» — не темы
+    return [w for w, n in counts.most_common(8) if n >= 3]
+
+
 async def life_day(bot_name: str, episodes: list[dict], talk: list[str]
                    ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Серия дня: ([(ЧЧ:ММ, событие)], [(ЧЧ:ММ, где он и что делает)])."""
     past = "\n".join(f"{time.strftime('%d.%m', time.localtime(e['at']))} — {e['text']}" for e in episodes)
     talk_part = ("\nЧто недавно говорили в чатах про его жизнь (советы друзей, его рассказы о себе — это уже было, "
                  "не противоречь, можно развить):\n" + "\n".join(talk) + "\n") if talk else ""
+    stale = stale_themes(episodes, bot_name)
     prompt = LIFE_DAY_TASK.format(now=_now_line(), bio=BIO, bot=bot_name, talk=talk_part,
-                                  episodes=past or "(это начало сериала)")
+                                  episodes=past or "(это начало сериала)",
+                                  stale=f" Эти линии уже приелись — сегодня без них: {', '.join(stale)}." if stale else "")
     started = time.monotonic()
     result = await _ask(LIFE_SYSTEM.format(bot=bot_name), prompt, think=False, timeout=120, background=True)
     _log_usage("расписал свой день", started, result)

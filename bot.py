@@ -414,6 +414,8 @@ async def send_ai(msg: Message, *, author: str | None, reply=False, maybe=False)
             await asyncio.sleep(random.uniform(0.7, 1.8))
         await (msg.reply if reply and i == 0 else msg.answer)(line)
         ai.remember(chat_id, name, line)
+    if answer.lines:
+        log.info("Сказал в %s: %s", chat_id, " / ".join(answer.lines)[:300])
     sent = bool(reacted or voiced or answer.lines)
     # Стикеры не чаще раза в STICKER_EVERY ответов, а то Claude ими заваливает.
     _replies_since_sticker[chat_id] = _replies_since_sticker.get(chat_id, STICKER_EVERY) + 1
@@ -1127,14 +1129,25 @@ def name_pattern(first_name: str) -> re.Pattern:
 class _Talk:
     user_id: int
     until: float
+    turns: int = 0  # сколько раз подряд бот ответил без прямого обращения
 
 
 _talks: dict[int, _Talk] = {}  # с кем бот сейчас разговаривает в чате
 
 
-def start_talk(msg: Message) -> None:
-    if msg.from_user and msg.chat.type != ChatType.PRIVATE:
-        _talks[msg.chat.id] = _Talk(msg.from_user.id, time.monotonic() + FOLLOWUP_WINDOW)
+FOLLOWUP_MAX = 3  # без прямого обращения — не больше стольких ответов подряд, а то надоедает
+
+
+def start_talk(msg: Message, followup: bool = False) -> None:
+    """Бот ответил — следующие FOLLOWUP_WINDOW секунд может ответить и без обращения, но не бесконечно."""
+    if not msg.from_user or msg.chat.type == ChatType.PRIVATE:
+        return
+    old = _talks.get(msg.chat.id)
+    turns = old.turns + 1 if followup and old and old.user_id == msg.from_user.id else 0
+    if turns >= FOLLOWUP_MAX:
+        _talks.pop(msg.chat.id, None)  # хватит: дальше — только если позовут
+        return
+    _talks[msg.chat.id] = _Talk(msg.from_user.id, time.monotonic() + FOLLOWUP_WINDOW, turns)
 
 
 def is_followup(msg: Message, bot_id: int) -> bool:
@@ -1150,7 +1163,7 @@ def is_followup(msg: Message, bot_id: int) -> bool:
 
 async def answer_followup(msg: Message) -> None:
     if await send_ai(msg, author=author_of(msg), maybe=True):
-        start_talk(msg)  # разговор продолжается
+        start_talk(msg, followup=True)  # разговор продолжается
     else:
         _talks.pop(msg.chat.id, None)  # Claude решил, что это не ему
 
@@ -1592,6 +1605,16 @@ async def update_lore(bot: Bot, chat_id: int) -> None:
     ai.refresh(chat_id)
 
 
+def plan_source(rows: list[tuple[int, str, str, int]], quote: str) -> int | None:
+    """Где в переписке эта фраза (номер строки) — или None, если её там нет."""
+    best, best_score = None, 0.0
+    for i, (_, _, text, _) in enumerate(rows):
+        score = ai.similarity(quote, text) + (1.0 if ai._plain(quote) and ai._plain(quote) in ai._plain(text) else 0.0)
+        if score > best_score:
+            best, best_score = i, score
+    return best if best_score >= 0.6 else None
+
+
 def fit_ask_time(at: int, now: float) -> int | None:
     """Когда спрашивать: днём, не раньше чем через час и не позже чем через две недели."""
     if not now + 3600 <= at <= now + 15 * 86400:
@@ -1613,10 +1636,21 @@ async def update_plans(bot: Bot, chat_id: int) -> None:
     else:  # первый раз — только последние пару дней: старое уже неактуально
         rows = [r for r in storage.dialog_tail(chat_id, 1500) if r[3] >= now - 2 * 86400]
     if rows:
-        found = await ai.find_plans(await bot_name(bot), rows, storage.people(chat_id), storage.open_plans(chat_id))
-        for at, who, about in found:
+        planned = storage.open_plans(chat_id)
+        found = await ai.find_plans(await bot_name(bot), rows, storage.people(chat_id), planned)
+        for at, who, about, quote in found:
+            source = plan_source(rows, quote)
+            if source is None:  # такой фразы в переписке нет — модель додумала: не спрашиваем
+                log.info("План «%s» отброшен: не нашёл фразу «%s»", about, quote)
+                continue
+            who = canonical_name(chat_id, re.sub(r"\s*\(в ответ .*\)$", "", rows[source][1]))  # настоящий автор
+            context = ai.format_dialog(rows[max(0, source - 3):source + 2])[:700]
+            if ai.LORE_BANNED.search(f"{about} {quote}") or any(
+                    p["who"] == who and ai.similar(p["about"], about) for p in planned):
+                continue  # личное — или про это уже помним
             if when := fit_ask_time(at, now):
-                storage.add_plan(chat_id, who, about, when)
+                storage.add_plan(chat_id, who, about, when, quote=rows[source][2][:300], context=context)
+                planned.append({"who": who, "about": about})
                 log.info("Спрошу %s про «%s» — %s", who, about, time.strftime("%d.%m %H:%M", time.localtime(when)))
     last = rows[-1][0] if rows else (storage.dialog_tail(chat_id, 1) or [(0,)])[0][0]
     storage.save_plans_upto(chat_id, last)
@@ -1721,7 +1755,11 @@ async def ask_about_plan(bot: Bot, chat_id: int, now: float) -> bool | None:
         if now - plan["ask_at"] > 2 * 86400:  # пропустили (бот лежал) — уже не в тему
             storage.set_plan_status(plan["id"], "skipped")
             continue
-        task = ai.TASK_FOLLOWUP.format(who=plan["who"], about=plan["about"], when=human_ago(plan["created_at"], now))
+        if not plan["quote"]:  # старый план без исходной фразы — не знаем, всерьёз ли это было
+            storage.set_plan_status(plan["id"], "skipped")
+            continue
+        task = ai.TASK_FOLLOWUP.format(who=plan["who"], quote=plan["quote"], context=plan["context"],
+                                       when=human_ago(plan["created_at"], now).capitalize())
         sent = await say_first(bot, chat_id, task, user_for_name(chat_id, plan["who"]))
         storage.set_plan_status(plan["id"], "asked" if sent else "skipped")
         if sent:
@@ -1789,7 +1827,7 @@ async def watch_initiative(bot: Bot) -> None:
 
 FEEL_EVERY, FEEL_GAP = 25, 15 * 60  # раз в столько сообщений (но не чаще) бот прислушивается к себе
 MOOD_TTL = 6 * 3600                 # настроение проходит само
-RELATION_FADE_DAYS = 4              # отношения остывают на 1 за столько дней
+RELATION_FADE_DAYS = 3              # отношения остывают на 1 за столько дней
 LIFE_START = 7  # с этого часа бот расписывает свой день; что раньше — ещё «вчера» (после полуночи)
 RELATION_WORDS = {5: "любимчик", 4: "любимчик", 3: "кореш", 2: "тепло", 1: "чуть теплее обычного",
                   -1: "слегка бесит", -2: "бесит", -3: "соперник", -4: "вечный бэф", -5: "вечный бэф"}
@@ -1814,9 +1852,10 @@ def relation_score(rel: dict, now: float) -> int:
 
 
 def state_text(chat_id: int) -> str:
-    """Настроение и отношения словами — для Claude и для /mood."""
+    """Настроение, где бот по жизни и отношения словами — для модели и для /mood."""
     now, feelings = time.time(), storage.feelings(chat_id)
-    mood = f"{feelings['mood']} — {feelings['why']}" if feelings and now - feelings["at"] < MOOD_TTL else "обычное"
+    fresh = feelings and now - feelings["at"] < MOOD_TTL
+    mood = (f"{feelings['mood']} — {feelings['why']}" if feelings["why"] else feelings["mood"]) if fresh else "обычное"
     lines = [f"Настроение: {mood}"]
     if activity := current_activity(now):
         lines.append(f"По жизни сейчас: {activity}")
@@ -1824,7 +1863,9 @@ def state_text(chat_id: int) -> str:
     rels = sorted((r for r in rels if r[1]), key=lambda r: -r[1])
     if rels:
         lines.append("Отношения:")
-        lines += [f"- {name}: {RELATION_WORDS[score]}" + (f" ({note})" if note else "") for name, score, note in rels]
+        for i, (name, score, note) in enumerate(rels):
+            word = RELATION_WORDS[score] if score < 4 or i == 0 else "кореш"  # любимчик — только один
+            lines.append(f"- {name}: {word}" + (f" ({note})" if note else ""))
     return "\n".join(lines)
 
 
@@ -1857,8 +1898,7 @@ async def update_feelings(bot: Bot, chat_id: int, first: bool = False) -> None:
         name = canonical_name(chat_id, raw)
         old = known.get(name.casefold())
         score = max(-5, min(5, (relation_score(old, now) if old else 0) + delta))
-        notes = f"{note}; {old['note']}"[:160] if old and old["note"] else note
-        storage.set_relation(chat_id, old["name"] if old else name, score, notes)
+        storage.set_relation(chat_id, old["name"] if old else name, score, note[:90])  # только последнее
     ai.set_state(chat_id, state_text(chat_id))
     log.info("Характер в %s: %s", chat_id, state_text(chat_id).replace("\n", " · "))
 

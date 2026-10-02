@@ -241,6 +241,10 @@ class Storage:
                           ("people", "TEXT"), ("faces_at", "INTEGER")):  # кто из записавшихся на фото
             if col not in media_cols:
                 self.db.execute(f"ALTER TABLE media ADD COLUMN {col} {kind}")
+        plan_cols = {row[1] for row in self.db.execute("PRAGMA table_info(plans)")}
+        for col in ("quote", "context"):  # дословная фраза и сообщения вокруг — чтобы не спросить про шутку всерьёз
+            if col not in plan_cols:
+                self.db.execute(f"ALTER TABLE plans ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         sticker_cols = {row[1] for row in self.db.execute("PRAGMA table_info(stickers)")}
         for col in ("description", "thumb_id", "kind"):  # база до того, как бот научился видеть стикеры
             if col not in sticker_cols:
@@ -389,17 +393,19 @@ class Storage:
         """Беседы (не лички), где есть переписка."""
         return [r[0] for r in self.db.execute("SELECT DISTINCT chat_id FROM dialog WHERE chat_id < 0")]
 
-    def add_plan(self, chat_id: int, who: str, about: str, ask_at: int) -> None:
+    def add_plan(self, chat_id: int, who: str, about: str, ask_at: int, quote: str = "", context: str = "") -> None:
         with self.db:
-            self.db.execute("INSERT INTO plans (chat_id, who, about, ask_at, created_at) VALUES (?, ?, ?, ?, ?)",
-                            (chat_id, who, about, ask_at, int(time.time())))
+            self.db.execute(
+                "INSERT INTO plans (chat_id, who, about, ask_at, created_at, quote, context) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, who, about, ask_at, int(time.time()), quote, context),
+            )
 
     def open_plans(self, chat_id: int) -> list[dict]:
         rows = self.db.execute(
-            "SELECT id, who, about, ask_at, created_at FROM plans WHERE chat_id = ? AND status = 'open' ORDER BY ask_at",
-            (chat_id,),
+            "SELECT id, who, about, ask_at, created_at, quote, context FROM plans WHERE chat_id = ? AND status = 'open'"
+            " ORDER BY ask_at", (chat_id,),
         ).fetchall()
-        return [dict(zip(("id", "who", "about", "ask_at", "created_at"), r)) for r in rows]
+        return [dict(zip(("id", "who", "about", "ask_at", "created_at", "quote", "context"), r)) for r in rows]
 
     def set_plan_status(self, plan_id: int, status: str) -> None:
         with self.db:
